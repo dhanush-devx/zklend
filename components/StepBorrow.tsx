@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { borrowTokens } from '@/lib/starkzap'
+import { borrowWithProof } from "@/lib/starkzap"
 import { INCOME_TIERS, type IncomeProof } from '@/lib/reclaim'
 import type { StarkzapUser } from '@/lib/starkzap'
 
@@ -16,10 +16,13 @@ const DURATION_OPTIONS = [7, 14, 30, 60, 90]
 
 export default function StepBorrow({ proof, user, onComplete }: Props) {
   const maxBorrow = proof.borrowLimit
-  const [amount, setAmount] = useState(Math.floor(maxBorrow * 0.3))
+  const [amount, setAmount] = useState(Math.max(1, Math.floor(maxBorrow * 0.3)))
   const [duration, setDuration] = useState(30)
+  const [wallet, setWallet] = useState(user.address)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+
+  const walletValid = /^0x[0-9a-fA-F]{1,64}$/.test(wallet.trim())
 
   const tierInfo = INCOME_TIERS[proof.tier]
   const utilizationPct = (amount / maxBorrow) * 100
@@ -36,7 +39,7 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
 
     try {
       // Gasless borrow via Starkzap — no STRK for gas needed
-      const txHash = await borrowTokens(BigInt(amount), duration)
+      const txHash = await borrowWithProof(proof.tier, BigInt(amount), duration)
       onComplete(txHash)
     } catch (err: any) {
       setError(err?.message || 'Transaction failed. Try again.')
@@ -64,7 +67,7 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
       <div className="border border-[#1F1F1F] rounded-sm p-4 space-y-3">
         <div className="flex justify-between items-center">
           <span className="font-mono text-xs text-[#444]">CREDIT_LIMIT</span>
-          <span className="font-mono text-sm text-[#00FF88]">₹{maxBorrow.toLocaleString()}</span>
+          <span className="font-mono text-sm text-[#00FF88]">{maxBorrow} STRK</span>
         </div>
         <div className="h-1.5 bg-[#1F1F1F] rounded-full overflow-hidden">
           <div
@@ -84,7 +87,7 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
             {utilizationPct.toFixed(0)}% utilized
           </span>
           <span className="font-mono text-xs text-[#555]">
-            ₹{(maxBorrow - amount).toLocaleString()} remaining
+            {maxBorrow - amount} STRK remaining
           </span>
         </div>
       </div>
@@ -94,21 +97,21 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
         <div className="flex justify-between items-baseline">
           <span className="font-mono text-xs text-[#444]">BORROW_AMOUNT</span>
           <span className="font-display text-3xl font-bold text-white number-display">
-            ₹{amount.toLocaleString()}
+            {amount} STRK
           </span>
         </div>
         <input
           type="range"
-          min={1000}
+          min={1}
           max={maxBorrow}
-          step={1000}
+          step={1}
           value={amount}
           onChange={e => setAmount(Number(e.target.value))}
           className="w-full"
         />
         <div className="flex justify-between">
-          <span className="font-mono text-xs text-[#333]">₹1,000</span>
-          <span className="font-mono text-xs text-[#333]">₹{maxBorrow.toLocaleString()}</span>
+          <span className="font-mono text-xs text-[#333]">1 STRK</span>
+          <span className="font-mono text-xs text-[#333]">{maxBorrow} STRK</span>
         </div>
       </div>
 
@@ -135,10 +138,10 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
       {/* Repayment breakdown */}
       <div className="border border-[#1F1F1F] rounded-sm divide-y divide-[#1F1F1F]">
         {[
-          { label: 'Principal',    value: `₹${amount.toLocaleString()}` },
-          { label: `Interest (8% APR, ${duration}d)`, value: `₹${interest.toFixed(0)}` },
-          { label: 'Total repay',  value: `₹${totalRepay.toFixed(0)}`, bold: true },
-          { label: 'Daily cost',   value: `₹${dailyRepay.toFixed(0)}/day` },
+          { label: 'Principal',    value: `${amount} STRK` },
+          { label: `Interest (8% APR, ${duration}d)`, value: `${interest.toFixed(2)} STRK` },
+          { label: 'Total repay',  value: `${totalRepay.toFixed(2)} STRK`, bold: true },
+          { label: 'Daily cost',   value: `${dailyRepay.toFixed(2)} STRK/day` },
         ].map(row => (
           <div key={row.label} className="flex justify-between items-center px-3 py-2">
             <span className={`font-mono text-xs ${row.bold ? 'text-[#888]' : 'text-[#444]'}`}>{row.label}</span>
@@ -149,16 +152,30 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
         ))}
       </div>
 
-      {/* Wallet + gasless note */}
-      <div className="flex items-center gap-2 bg-[#0D0D0D] border border-[#1F1F1F] rounded-sm px-3 py-2">
-        <div className="w-1.5 h-1.5 rounded-full bg-[#00FF88] animate-pulse" />
-        <span className="font-mono text-xs text-[#555]">
-          Sending to{' '}
-          <span className="text-[#888]">
-            {user.address.slice(0, 6)}...{user.address.slice(-4)}
-          </span>
-          {' '}· Gasless via Starkzap
-        </span>
+      {/* Wallet input */}
+      <div className="space-y-1.5">
+        <span className="font-mono text-xs text-[#444]">RECIPIENT_WALLET</span>
+        <div className={`flex items-center border rounded-sm bg-[#0A0A0A] transition-colors ${
+          walletValid ? 'border-[#2A2A2A] focus-within:border-[rgba(0,255,136,0.4)]' : 'border-[rgba(255,59,92,0.4)]'
+        }`}>
+          <div className="w-1.5 h-1.5 rounded-full bg-[#00FF88] animate-pulse ml-3 flex-shrink-0" />
+          <input
+            type="text"
+            value={wallet}
+            onChange={e => setWallet(e.target.value)}
+            placeholder="0x..."
+            className="flex-1 bg-transparent font-mono text-xs text-[#888] px-3 py-3 outline-none placeholder-[#333]"
+          />
+          {wallet !== user.address && (
+            <button
+              onClick={() => setWallet(user.address)}
+              className="font-mono text-xs text-[#444] hover:text-[#666] px-3 flex-shrink-0"
+            >
+              reset
+            </button>
+          )}
+        </div>
+        <p className="font-mono text-xs text-[#333]">Gasless via Starkzap paymaster</p>
       </div>
 
       {error && (
@@ -167,21 +184,18 @@ export default function StepBorrow({ proof, user, onComplete }: Props) {
 
       <button
         onClick={handleBorrow}
-        disabled={loading}
-        className="btn-primary w-full py-4 rounded-sm text-sm font-bold"
+        disabled={loading || !walletValid}
+        className="btn-primary w-full py-4 rounded-sm text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed"
       >
         {loading ? (
           <span className="flex items-center justify-center gap-2">
             <SpinIcon /> Processing gasless tx...
           </span>
         ) : (
-          `Borrow ₹${amount.toLocaleString()} — No Gas →`
+          `Borrow ${amount} STRK — No Gas →`
         )}
       </button>
 
-      <p className="text-xs text-[#333] text-center">
-        Transaction executed via Starkzap paymaster. No STRK required.
-      </p>
     </div>
   )
 }

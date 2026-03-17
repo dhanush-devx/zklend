@@ -55,11 +55,11 @@ ZKLend is the first income-verified lending protocol on Starknet, using:
 
 ## Income Tiers & Borrow Limits
 
-| Tier | Income Range | Max Borrow | LTV |
-|------|-------------|------------|-----|
-| 1 | ₹25k–₹50k/mo | ~500 STRK | 40% of monthly |
-| 2 | ₹50k–₹1L/mo | ~1,500 STRK | 50% of monthly |
-| 3 | ₹1L+/mo | ~4,000 STRK | 60% of monthly |
+| Tier | Income Range | Max Borrow |
+|------|-------------|------------|
+| 1 | ₹0–₹25k/mo | 10 STRK |
+| 2 | ₹25k–₹50k/mo | 100 STRK |
+| 3 | ₹50k+/mo | 200 STRK |
 
 **Interest rate:** 8% APR (flat). **Duration:** 7–90 days.
 
@@ -83,11 +83,141 @@ Without Starkzap, this product doesn't exist. The target user — someone with a
 
 ```
 Frontend:   Next.js 14 (App Router) + Tailwind CSS
-Wallet:     Starkzap (social login + gasless AA)
+Wallet:     Starkzap / Cartridge Controller (social login + gasless AA)
 ZK Proofs:  Reclaim Protocol (income verification)
-Contract:   Cairo 2.x (ZKLend.cairo)
+Contract:   Cairo 2.x (ZKLend.cairo) — deployed on Starknet Sepolia
 Chain:      Starknet Sepolia (testnet) / Mainnet
 ```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        User's Browser                        │
+│                                                             │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   │
+│  │ StepConnect  │──▶│  StepVerify  │──▶│  StepBorrow  │   │
+│  │              │   │              │   │              │   │
+│  │  Cartridge   │   │   Reclaim    │   │  multicall   │   │
+│  │  Controller  │   │   SDK        │   │  (2 calls)   │   │
+│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘   │
+│         │                  │                   │            │
+└─────────┼──────────────────┼───────────────────┼────────────┘
+          │                  │                   │
+          ▼                  ▼                   ▼
+   ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐
+   │  Cartridge  │   │   Reclaim    │   │  ZKLend Cairo    │
+   │  Controller │   │   Attestors  │   │  Contract        │
+   │  (Starknet  │   │              │   │                  │
+   │   AA Wallet)│   │  TLS proof   │   │ submit_income_   │
+   │             │   │  of payroll  │   │ proof(tier)      │
+   │  social     │   │  provider    │   │                  │
+   │  login +    │   │  page →      │   │ borrow(amount,   │
+   │  passkeys   │   │  income tier │   │   duration)      │
+   └─────────────┘   └──────────────┘   └────────┬─────────┘
+                                                  │
+                                         STRK transfer
+                                                  │
+                                                  ▼
+                                         ┌─────────────────┐
+                                         │  Starkzap       │
+                                         │  Paymaster      │
+                                         │  (covers gas)   │
+                                         └─────────────────┘
+```
+
+### Key architectural decisions
+
+**Single multicall transaction** — `submit_income_proof` and `borrow` are executed atomically in one transaction. This prevents a race condition where the proof is submitted but the borrow fails, and saves one round-trip confirmation for the user.
+
+**Income tier on-chain, salary off-chain** — the ZK proof establishes which tier (1/2/3) a user falls into. Only the tier integer is written to the contract. The raw income figure never touches the chain.
+
+**Proof validity window** — income proofs expire after 30 days (`PROOF_VALIDITY = 2_592_000` seconds) on-chain. Users must re-verify to borrow again after expiry.
+
+**Stateless frontend** — the app holds no backend. All state lives either in the user's browser session or on-chain. The Reclaim proof session is established client-side via the SDK.
+
+---
+
+## Reclaim Protocol Integration
+
+Reclaim Protocol generates **TLS-based ZK proofs** — it proves that a specific HTTPS response was received from a trusted server (e.g. Razorpay Payroll, Deel, Gusto) without revealing the full response content.
+
+### Flow
+
+```
+1. Frontend calls ReclaimProofRequest.init(APP_ID, APP_SECRET, PROVIDER_ID)
+   └─ Creates a proof session on Reclaim's attestor network
+
+2. getRequestUrl() returns a deep-link URL
+   └─ Rendered as a QR code (desktop) or direct link (mobile)
+
+3. User opens the URL on their phone
+   └─ Reclaim app connects to their payroll provider
+   └─ TLS session is witnessed by Reclaim attestors
+   └─ ZK proof generated locally: "this response contains salary ≥ ₹X"
+
+4. proofRequest.startSession({ onSuccess }) fires when proof is ready
+   └─ verifyProof(proof) checks attestor signatures on the frontend
+   └─ extractedParameterValues.monthly_income parsed → income tier assigned
+
+5. proofBytes (felt252 array) passed to the Cairo contract via calldata
+```
+
+### Provider IDs
+
+Find income/salary providers at [dev.reclaimprotocol.org/explore](https://dev.reclaimprotocol.org/explore). Set in `.env.local`:
+
+```
+NEXT_PUBLIC_RECLAIM_APP_ID=your-app-id
+NEXT_PUBLIC_RECLAIM_APP_SECRET=your-app-secret
+NEXT_PUBLIC_RECLAIM_PROVIDER_ID=your-provider-id
+```
+
+Without these, the app falls back to **demo mode** — a simulated proof flow with a mock tier selection. No real income is verified but the full borrow flow still executes on-chain.
+
+---
+
+## Cartridge Controller Integration
+
+[Cartridge Controller](https://docs.cartridge.gg/) is a Starknet Account Abstraction wallet that replaces seed phrases with passkeys and social login.
+
+### How ZKLend uses it
+
+```typescript
+// lib/starkzap.ts
+
+const sdk = new StarkZap({ network: 'sepolia' })
+
+// Opens a popup: Google / Twitter / email / passkey
+// Auto-creates an AA wallet — no seed phrase, no gas required from user
+_wallet = await sdk.connectCartridge({
+  policies: [
+    { target: LENDING_CONTRACT, method: 'submit_income_proof' },
+    { target: LENDING_CONTRACT, method: 'borrow' },
+    { target: LENDING_CONTRACT, method: 'repay' },
+  ],
+  feeMode: 'sponsored',  // Starkzap paymaster covers gas
+})
+```
+
+**Policies** — the user pre-approves specific contract methods at login time. This means borrowing later requires zero wallet interaction — no popup, no confirmation, no gas prompt. The transaction executes silently in the background.
+
+**Sponsored fee mode** — gas is covered by the Starkzap paymaster. The borrower needs zero STRK to interact with the protocol.
+
+**Fallback** — if the sponsored flow is unavailable, `executeGasless` falls back to `user_pays` mode automatically.
+
+### Why this matters
+
+Without Cartridge, every transaction requires:
+1. User has MetaMask / Argent X installed
+2. User holds STRK for gas
+3. User manually confirms each transaction
+
+With Cartridge + Starkzap:
+1. Login with Google
+2. Done
 
 ---
 
@@ -96,19 +226,19 @@ Chain:      Starknet Sepolia (testnet) / Mainnet
 ```
 starkzap-lending/
 ├── app/
-│   ├── page.tsx          # Main 3-step borrowing flow
+│   ├── page.tsx          # Main 3-step borrowing flow + state machine
 │   ├── layout.tsx
 │   └── globals.css
 ├── components/
-│   ├── StepConnect.tsx   # Starkzap social login
-│   ├── StepVerify.tsx    # Reclaim ZK income proof
-│   ├── StepBorrow.tsx    # Loan configuration + execution
-│   └── Dashboard.tsx     # Success + loan details
+│   ├── StepConnect.tsx   # Cartridge Controller social login
+│   ├── StepVerify.tsx    # Reclaim ZK income proof (real + mock fallback)
+│   ├── StepBorrow.tsx    # Loan config + multicall execution
+│   └── Dashboard.tsx     # Success screen + loan details
 ├── lib/
-│   ├── starkzap.ts       # Starkzap SDK wrapper
-│   └── reclaim.ts        # Reclaim Protocol integration
+│   ├── starkzap.ts       # Starkzap/Cartridge SDK wrapper + contract calls
+│   └── reclaim.ts        # Reclaim Protocol: proof request, session, parsing
 └── contracts/
-    └── ZKLend.cairo      # On-chain lending logic
+    └── src/lib.cairo     # ZKLend Cairo contract (deployed on Sepolia)
 ```
 
 ---
@@ -138,18 +268,41 @@ Open [http://localhost:3000](http://localhost:3000).
 ## Contract Deployment (Starknet Sepolia)
 
 ```bash
-# Install Scarb
+# Install Scarb + Starknet Foundry
 curl --proto '=https' --tlsv1.2 -sSf https://docs.swmansion.com/scarb/install.sh | sh
+curl -L https://raw.githubusercontent.com/foundry-rs/starknet-foundry/master/scripts/install.sh | sh
 
 # Build
+cd contracts
 scarb build
 
-# Deploy (using starkli)
-starkli deploy \
-  ./target/dev/ZKLend.json \
-  --constructor-calldata \
-    <STRK_TOKEN_ADDRESS> \
-    <RECLAIM_VERIFIER_ADDRESS>
+# Declare + deploy (sncast uses Scarb's compiler — avoids CASM hash mismatch)
+sncast \
+  --account <YOUR_ACCOUNT> \
+  --accounts-file <PATH_TO_ACCOUNTS_JSON> \
+  declare \
+  --url <RPC_URL> \
+  --contract-name ZKLend
+
+sncast \
+  --account <YOUR_ACCOUNT> \
+  --accounts-file <PATH_TO_ACCOUNTS_JSON> \
+  deploy \
+  --url <RPC_URL> \
+  --class-hash <CLASS_HASH_FROM_DECLARE> \
+  --arguments <STRK_SEPOLIA_TOKEN_ADDRESS>
+
+# STRK token on Sepolia:
+# 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d
+
+# Fund the contract (it holds the lending pool)
+# Send STRK directly to the deployed contract address from any wallet
+```
+
+**Live deployment (Starknet Sepolia):**
+```
+Contract: 0x032ee7b733159ef554ff7689613ec3e3b5efe8860e899bee68e00e4223c5eee4
+Class:    0x0054bb315cf544d1a24cf5358f270911c54d76a570acc0ddd9b0209ab16593e3
 ```
 
 ---

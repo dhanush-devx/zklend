@@ -1,19 +1,19 @@
 /**
- * Reclaim Protocol Integration
- * 
- * Reclaim lets users prove claims about web2 data without revealing the data.
- * Example: "My salary is between $3000-$5000/month" without showing payslip.
- * 
+ * Reclaim Protocol Integration — Real SDK
+ *
  * Flow:
- * 1. User connects payroll provider (Razorpay Payroll, Gusto, Deel, etc.)
- * 2. Reclaim generates a ZK proof of the income range
- * 3. Proof is verified on-chain via our Cairo contract
- * 
- * Install: npm install @reclaim-protocol/js-sdk
- * Docs: https://dev.reclaimprotocol.org/
+ * 1. init() → creates a proof request session
+ * 2. getVerificationUrl() → URL to open (QR on desktop, redirect on mobile)
+ * 3. startSession() → polls for proof completion
+ * 4. verifyProof() → verify signature on frontend
+ * 5. transformForOnchain() → convert to felt252 array for Cairo
+ *
+ * Get credentials: https://dev.reclaimprotocol.org/
+ * npm install @reclaimprotocol/js-sdk
  */
 
-import type { ReclaimProofRequest } from '@reclaimprotocol/js-sdk'
+import { ReclaimProofRequest, verifyProof, transformForOnchain } from '@reclaimprotocol/js-sdk'
+import type { Proof } from '@reclaimprotocol/js-sdk'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -21,145 +21,134 @@ export type IncomeTier = 1 | 2 | 3
 
 export interface IncomeProof {
   tier: IncomeTier
-  tierLabel: string           // "₹50k–₹1L/mo"
-  proofBytes: string[]        // compressed ZK proof for on-chain verification
-  reclaimProof: string        // raw Reclaim proof JSON
-  verifiedAt: number          // timestamp
-  borrowLimit: number         // in USDC cents
+  tierLabel: string
+  borrowLimit: number
+  proofBytes: string[]
+  rawProof: Proof | null
+  verifiedAt: number
+  isMock: boolean
 }
 
 export const INCOME_TIERS = {
-  1: { label: '₹25k–₹50k / mo',  borrowLimit: 50_000,  ltv: 0.4 },
-  2: { label: '₹50k–₹1L / mo',   borrowLimit: 150_000, ltv: 0.5 },
-  3: { label: '₹1L+ / mo',       borrowLimit: 400_000, ltv: 0.6 },
+  1: { label: '₹0–₹25k / mo',   borrowLimit: 10 },
+  2: { label: '₹25k–₹50k / mo', borrowLimit: 100 },
+  3: { label: '₹50k+ / mo',     borrowLimit: 200 },
 }
 
-// Reclaim App credentials — get from https://dev.reclaimprotocol.org/
-const RECLAIM_APP_ID = process.env.NEXT_PUBLIC_RECLAIM_APP_ID || 'demo'
-const RECLAIM_APP_SECRET = process.env.RECLAIM_APP_SECRET || 'demo'
+// ─── Reclaim App Config ───────────────────────────────────────────────────────
+// Get from https://dev.reclaimprotocol.org/
+// Provider IDs for salary verification (use real ones from Reclaim dashboard)
 
-// Provider IDs for income verification
-// These are pre-built Reclaim providers for payroll data
-const PROVIDERS = {
-  RAZORPAY_PAYROLL: 'f9f383fd-32d9-4c54-942f-5e9fda349762',
-  DEEL: 'a4d5a8e2-1c3f-4b7d-8e9a-2f6c3d1e5b8a',
-  LINKEDIN_SALARY: 'b2c4e6f8-3a5d-7b9c-1e3f-5a7c9e1d3f5b',
+const APP_ID     = process.env.NEXT_PUBLIC_RECLAIM_APP_ID || ''
+const APP_SECRET = process.env.NEXT_PUBLIC_RECLAIM_APP_SECRET || ''
+
+// Provider IDs — find salary/income providers in Reclaim dashboard
+// These are examples; check https://dev.reclaimprotocol.org/explore for current ones
+export const INCOME_PROVIDERS = {
+  LINKEDIN:  '6d3f6753-7ee6-49ee-a545-62f1b1822ae5', // LinkedIn salary (example)
+  RAZORPAY:  'f9f383fd-32d9-4c54-942f-5e9fda349762', // Razorpay Payroll (example)
+  GENERIC:   'YOUR_PROVIDER_ID',                       // Replace with real provider ID
 }
 
-// ─── Real Reclaim Integration ─────────────────────────────────────────────────
+// ─── Real Reclaim Flow ────────────────────────────────────────────────────────
 
-export async function initReclaimRequest(
-  providerId: string,
-  callbackUrl: string
-): Promise<{ qrUrl: string; requestId: string }> {
-  try {
-    const { ReclaimProofRequest } = await import('@reclaimprotocol/js-sdk')
-
-    const proofRequest = await ReclaimProofRequest.init(
-      RECLAIM_APP_ID,
-      RECLAIM_APP_SECRET,
-      providerId
-    )
-
-    // Set callback URL where proof will be delivered
-    proofRequest.setAppCallbackUrl(callbackUrl)
-
-    const requestUrl = await proofRequest.getRequestUrl()
-    const requestId = proofRequest.getRequestId()
-
-    return { qrUrl: requestUrl, requestId }
-  } catch (e) {
-    console.error('Reclaim init failed, using mock:', e)
-    return mockReclaimRequest()
+export async function createIncomeProofRequest(providerId: string): Promise<{
+  requestUrl: string
+  proofRequest: ReclaimProofRequest
+}> {
+  if (!APP_ID || !APP_SECRET) {
+    throw new Error('NEXT_PUBLIC_RECLAIM_APP_ID and NEXT_PUBLIC_RECLAIM_APP_SECRET required in .env.local')
   }
+
+  const proofRequest = await ReclaimProofRequest.init(APP_ID, APP_SECRET, providerId, {
+    log: false,
+    acceptAiProviders: true,
+  })
+
+  const requestUrl = await proofRequest.getRequestUrl()
+  return { requestUrl, proofRequest }
 }
 
-export async function verifyReclaimProof(proofJson: string): Promise<IncomeProof | null> {
-  try {
-    const { Reclaim } = await import('@reclaimprotocol/js-sdk')
-    const proof = JSON.parse(proofJson)
+export async function waitForProof(
+  proofRequest: ReclaimProofRequest,
+  onSuccess: (proof: IncomeProof) => void,
+  onError: (err: Error) => void
+): Promise<void> {
+  await proofRequest.startSession({
+    onSuccess: async (rawProof) => {
+      try {
+        const proof = Array.isArray(rawProof) ? rawProof[0] : rawProof
+        if (!proof) throw new Error('No proof received')
 
-    const isValid = await Reclaim.verifySignedProof(proof)
-    if (!isValid) return null
+        // Verify signature
+        const valid = await verifyProof(proof)
+        if (!valid) throw new Error('Proof signature invalid')
 
-    // Extract income range from proof context
-    // The provider returns structured data matching the income tier
-    const context = JSON.parse(proof.claimData.context)
-    const monthlyIncome = context.extractedParameters?.monthly_income || 0
-
-    return buildIncomeProof(monthlyIncome, proof)
-  } catch (e) {
-    console.error('Proof verification failed:', e)
-    return null
-  }
+        // Parse income from proof context
+        const incomeProof = parseIncomeFromProof(proof)
+        onSuccess(incomeProof)
+      } catch (e: any) {
+        onError(e)
+      }
+    },
+    onError,
+  })
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Parse proof → income tier ────────────────────────────────────────────────
 
-function buildIncomeProof(monthlyIncomeINR: number, rawProof: any): IncomeProof {
+function parseIncomeFromProof(proof: Proof): IncomeProof {
+  // Extract income from proof's extractedParameterValues
+  // The exact field depends on which Reclaim provider you use
+  // Common fields: monthly_income, salary, income_range
+  const params = proof.extractedParameterValues || {}
+  const rawIncome = params.monthly_income || params.salary || params.income || '0'
+  const monthlyIncome = parseFloat(String(rawIncome).replace(/[^0-9.]/g, '')) || 0
+
   let tier: IncomeTier
-  if (monthlyIncomeINR >= 100_000) tier = 3
-  else if (monthlyIncomeINR >= 50_000) tier = 2
+  if (monthlyIncome >= 50_000) tier = 3
+  else if (monthlyIncome >= 25_000) tier = 2
   else tier = 1
 
-  const tierInfo = INCOME_TIERS[tier]
-
-  // Compress proof to bytes for on-chain submission
-  const proofBytes = compressProofForCairo(rawProof)
+  // Convert proof to felt252 array for Cairo contract
+  let proofBytes: string[] = []
+  try {
+    const onchainData = transformForOnchain(proof)
+    proofBytes = Array.isArray(onchainData)
+      ? onchainData.map(String)
+      : Object.values(onchainData as Record<string, unknown>).map(String)
+  } catch (_) {
+    proofBytes = [proof.identifier || '0x0']
+  }
 
   return {
     tier,
-    tierLabel: tierInfo.label,
+    tierLabel: INCOME_TIERS[tier].label,
+    borrowLimit: INCOME_TIERS[tier].borrowLimit,
     proofBytes,
-    reclaimProof: JSON.stringify(rawProof),
+    rawProof: proof,
     verifiedAt: Date.now(),
-    borrowLimit: tierInfo.borrowLimit,
+    isMock: false,
   }
 }
 
-function compressProofForCairo(proof: any): string[] {
-  // Convert Reclaim proof to felt252 array for Cairo contract
-  // In production: use proper serialization matching your Cairo contract
-  const proofStr = JSON.stringify(proof)
-  const chunks: string[] = []
-  for (let i = 0; i < proofStr.length; i += 31) {
-    chunks.push('0x' + Buffer.from(proofStr.slice(i, i + 31)).toString('hex'))
-  }
-  return chunks
-}
+// ─── Mock fallback (when no Reclaim credentials) ─────────────────────────────
 
-// ─── Mock (Demo Mode) ─────────────────────────────────────────────────────────
-
-export async function mockReclaimRequest(): Promise<{ qrUrl: string; requestId: string }> {
-  await sleep(500)
-  return {
-    qrUrl: 'https://app.reclaimprotocol.org/demo',
-    requestId: 'mock-' + Math.random().toString(36).slice(2),
-  }
+export function isReclaimConfigured(): boolean {
+  return !!(APP_ID && APP_SECRET && APP_ID !== '' && APP_SECRET !== '')
 }
 
 export async function mockVerifyIncome(tier: IncomeTier): Promise<IncomeProof> {
-  await sleep(3000) // simulate proof generation time
-
-  const tierInfo = INCOME_TIERS[tier]
-  const mockIncome = tier === 1 ? 35000 : tier === 2 ? 75000 : 150000
-
+  await sleep(3500)
   return {
     tier,
-    tierLabel: tierInfo.label,
+    tierLabel: INCOME_TIERS[tier].label,
+    borrowLimit: INCOME_TIERS[tier].borrowLimit,
     proofBytes: ['0x' + Math.random().toString(16).slice(2)],
-    reclaimProof: JSON.stringify({ mock: true, income: mockIncome }),
+    rawProof: null,
     verifiedAt: Date.now(),
-    borrowLimit: tierInfo.borrowLimit,
+    isMock: true,
   }
-}
-
-export function getBorrowLimit(proof: IncomeProof): number {
-  return INCOME_TIERS[proof.tier].borrowLimit
-}
-
-export function getMaxLTV(proof: IncomeProof): number {
-  return INCOME_TIERS[proof.tier].ltv
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))

@@ -1,0 +1,1 @@
+{"version":1,"contracts":[{"id":"9rqbd27dekbbk","package_name":"zklend","contract_name":"ZKLend","module_path":"zklend::ZKLend","artifacts":{"sierra":"zklend_ZKLend.contract_class.json","casm":"zklend_ZKLend.compiled_contract_class.json"}}]}
